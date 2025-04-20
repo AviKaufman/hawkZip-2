@@ -1,242 +1,264 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <emmintrin.h>
+
 #include <omp.h>
 
-#define NUM_THREADS 4
+// fixed at 32
+#ifndef THREAD_COUNT
+#define THREAD_COUNT 32
+#endif
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 32
+#endif
 
-void hawkZip_compress_kernel(float* oriData, unsigned char* cmpData, int* absQuant, unsigned int* signFlag, int* fixedRate, unsigned int* threadOfs, size_t nbEle, size_t* cmpSize, float errorBound)
+// prototypes
+void hawkZip_compress_kernel(
+    float* oriData,
+    unsigned char* cmpData,
+    int* absQuant,
+    unsigned int* signFlag,
+    int* fixedRate,
+    unsigned int* threadOfs,
+    size_t nbEle,
+    size_t* cmpSize,
+    float errorBound);
+
+void hawkZip_decompress_kernel(
+    float* decData,
+    unsigned char* cmpData,
+    int* absQuant,
+    int* fixedRate,
+    unsigned int* threadOfs,
+    size_t nbEle,
+    float errorBound);
+
+
+// --- compress kernel with block‑local delta encoding ---
+void hawkZip_compress_kernel(
+    float* oriData,
+    unsigned char* cmpData,
+    int* absQuant,
+    unsigned int* signFlag,
+    int* fixedRate,
+    unsigned int* threadOfs,
+    size_t nbEle,
+    size_t* cmpSize,
+    float errorBound)
 {
-    // Shared variables across threads.
-    int chunk_size = (nbEle + NUM_THREADS - 1) / NUM_THREADS;
-    omp_set_num_threads(NUM_THREADS);
-    
-    // hawkZip parallel compression begin.
+    int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int chunk_size  = (nbEle + THREAD_COUNT - 1) / THREAD_COUNT;
+    omp_set_num_threads(THREAD_COUNT);
+
     #pragma omp parallel
     {
-        // Divide data chunk for each thread
-        int thread_id = omp_get_thread_num();
-        int start = thread_id * chunk_size;
-        int end = start + chunk_size;
-        if(end > nbEle) end = nbEle;
-        int block_num = (chunk_size+31)/32;
-        int start_block = thread_id * block_num;
-        int block_start, block_end;
-        const float recip_precision = 0.5f/errorBound;
-        int sign_ofs;
-        unsigned int thread_ofs = 0; 
+        int tid        = omp_get_thread_num();
+        int startElem  = tid * chunk_size;
+        int endElem    = startElem + chunk_size;
+        if (endElem > (int)nbEle) endElem = nbEle;
 
-        // Iterate all blocks in current thread.
-        for(int i=0; i<block_num; i++)
-        {
-            // Block initialization.
-            block_start = start + i * 32;
-            block_end = (block_start+32) > end ? end : block_start+32;
-            float data_recip;
-            int s;
-            int curr_quant, max_quant=0;
-            int curr_block = start_block + i;
-            unsigned int sign_flag = 0;
-            int temp_fixed_rate;
-            
-            // Prequantization, get absolute value for each data.
-            for(int j=block_start; j<block_end; j++)
-            {
-                // Prequantization.
-                data_recip = oriData[j] * recip_precision;
-                s = data_recip >= -0.5f ? 0 : 1;
-                curr_quant = (int)(data_recip + 0.5f) - s;
-                // Get sign data.
-                sign_ofs = j % 32;
-                sign_flag |= (curr_quant < 0) << (31 - sign_ofs);
-                // Get absolute quantization code.
-                max_quant = max_quant > abs(curr_quant) ? max_quant : abs(curr_quant);
-                absQuant[j] = abs(curr_quant);
+        int perThread  = (totalBlocks + THREAD_COUNT - 1) / THREAD_COUNT;
+        int startBlock = tid * perThread;
+        unsigned int local_ofs = 0;
+
+        // each block
+        for (int b = 0; b < perThread; b++) {
+            int g = startBlock + b;
+            if (g >= totalBlocks) break;
+
+            int bs = g * BLOCK_SIZE;
+            int be = bs + BLOCK_SIZE;
+            if (be > (int)nbEle) be = nbEle;
+            int len = be - bs;
+
+            // 1) quantize into a small local buffer
+            int qBuf[BLOCK_SIZE];
+            for (int i = 0; i < len; i++) {
+                float r = oriData[bs + i] * (0.5f / errorBound);
+                int sign = (r < -0.5f);
+                int q = (int)(r + 0.5f) - sign;
+                qBuf[i] = q;
             }
 
-            // Record fixed-length encoding rate for each block.
-            signFlag[curr_block] = sign_flag;
-            temp_fixed_rate = max_quant==0 ? 0 : sizeof(int) * 8 - __builtin_clz(max_quant);
-            fixedRate[curr_block] = temp_fixed_rate;
-            cmpData[curr_block] = (unsigned char)temp_fixed_rate;
+            // 2) delta‑encode Q into absQuant[], build new signFlag
+            unsigned int sflag = 0;
+            int max_q = 0;
 
-            // Inner thread prefix-sum.
-            thread_ofs += temp_fixed_rate ? (32+temp_fixed_rate*32)/8 : 0;
+            // element 0
+            int delta0 = qBuf[0];
+            int a0 = delta0 < 0 ? -delta0 : delta0;
+            absQuant[bs] = a0;
+            sflag |= (unsigned int)(delta0 < 0)
+                     << (BLOCK_SIZE - 1 - (bs % BLOCK_SIZE));
+            if (a0 > max_q) max_q = a0;
+            int prev = qBuf[0];
+
+            // the rest
+            for (int i = 1; i < len; i++) {
+                int d = qBuf[i] - prev;
+                int ad = d < 0 ? -d : d;
+                absQuant[bs + i] = ad;
+                sflag |= (unsigned int)(d < 0)
+                         << (BLOCK_SIZE - 1 - ((bs + i) % BLOCK_SIZE));
+                if (ad > max_q) max_q = ad;
+                prev = qBuf[i];
+            }
+
+            signFlag[g] = sflag;
+
+            // 3) determine bit‑width
+            int rate = max_q
+                       ? ((int)(sizeof(int)*8) - __builtin_clz(max_q))
+                       : 0;
+            fixedRate[g] = rate;
+            cmpData[g]   = (unsigned char)rate;
+
+            if (rate)
+                local_ofs += (BLOCK_SIZE + rate * BLOCK_SIZE) / 8;
         }
 
-        // Store thread ofs to global varaible, used for later global prefix-sum.
-        threadOfs[thread_id] = thread_ofs;
+        threadOfs[tid] = local_ofs;
         #pragma omp barrier
 
-        // Exclusive prefix-sum.
-        unsigned int global_ofs = 0;
-        for(int i=0; i<thread_id; i++) global_ofs += threadOfs[i];
-        unsigned int cmp_byte_ofs = global_ofs + block_num * NUM_THREADS;
+        // prefix-sum to compute write offset
+        unsigned int offs = 0;
+        for (int t = 0; t < tid; t++)
+            offs += threadOfs[t];
+        unsigned int write_ptr = offs + totalBlocks;
 
-        // Fixed-length encoding and store data to compressed data.
-        for(int i=0; i<block_num; i++)
-        {
-            // Block initialization.
-            block_start = start + i * 32;
-            block_end = (block_start+32) > end ? end : block_start+32;
-            int curr_block = start_block + i;
-            int temp_fixed_rate = fixedRate[curr_block];
-            unsigned int sign_flag = signFlag[curr_block];
+        // bit‑plane pack the deltas
+        for (int b = 0; b < perThread; b++) {
+            int g = startBlock + b;
+            if (g >= totalBlocks) break;
+            int rate = fixedRate[g];
+            if (!rate) continue;
 
-            // Operation for each block, if zero block then do nothing.
-            if(temp_fixed_rate)
-            {
-                // Retrieve sign information for one block.
-                cmpData[cmp_byte_ofs++] = 0xff & (sign_flag >> 24);
-                cmpData[cmp_byte_ofs++] = 0xff & (sign_flag >> 16);
-                cmpData[cmp_byte_ofs++] = 0xff & (sign_flag >> 8);
-                cmpData[cmp_byte_ofs++] = 0xff & sign_flag;
+            unsigned int sflag = signFlag[g];
+            // write 4‑byte sign flag
+            for (int byte = 3; byte >= 0; byte--)
+                cmpData[write_ptr++] =
+                  (sflag >> (8 * byte)) & 0xFF;
 
-                // Retrieve quant data for one block.
-                unsigned char tmp_char0, tmp_char1, tmp_char2, tmp_char3;
-                int mask = 1;
-                for(int j=0; j<temp_fixed_rate; j++)
-                {
-                    // Initialization.
-                    tmp_char0 = 0;
-                    tmp_char1 = 0;
-                    tmp_char2 = 0;
-                    tmp_char3 = 0;
-
-                    // Get ith bit in 0~7 quant, and store to tmp_char0.
-                    for(int k=block_start; k<block_start+8; k++)
-                        tmp_char0 |= (((absQuant[k] & mask) >> j) << (7+block_start-k));
-                    // Get ith bit in 8~15 quant, and store to tmp_char1.
-                    for(int k=block_start+8; k<block_start+16; k++)
-                        tmp_char1 |= (((absQuant[k] & mask) >> j) << (15+block_start-k));
-                    // Get ith bit in 16~23 quant, and store to tmp_char2.
-                    for(int k=block_start+16; k<block_start+24; k++)
-                        tmp_char2 |= (((absQuant[k] & mask) >> j) << (23+block_start-k));
-                    // Get ith bit in 24~31 quant, and store to tmp_char3.
-                    for(int k=block_start+24; k<block_end; k++)
-                        tmp_char3 |= (((absQuant[k] & mask) >> j) << (31+block_start-k));
-
-                    // Store data to compressed data array.
-                    cmpData[cmp_byte_ofs++] = tmp_char0;
-                    cmpData[cmp_byte_ofs++] = tmp_char1;
-                    cmpData[cmp_byte_ofs++] = tmp_char2;
-                    cmpData[cmp_byte_ofs++] = tmp_char3;
-                    mask <<= 1;
+            // write bitplanes of absQuant[bs..be)
+            int bs = g * BLOCK_SIZE;
+            int be = bs + BLOCK_SIZE;
+            if (be > (int)nbEle) be = nbEle;
+            unsigned int mask = 1;
+            for (int bit = 0; bit < rate; bit++) {
+                for (int chunk = 0; chunk < BLOCK_SIZE; chunk += 8) {
+                    unsigned char packed = 0;
+                    int limit = ((bs + chunk + 8) > be)
+                                ? (be - (bs + chunk)) : 8;
+                    for (int k = 0; k < limit; k++) {
+                        packed |=
+                          ((absQuant[bs + chunk + k] & mask) >> bit)
+                          << (7 - k);
+                    }
+                    cmpData[write_ptr++] = packed;
                 }
+                mask <<= 1;
             }
         }
-        
-        // Return the compression data length.
-        if(thread_id == NUM_THREADS - 1)
-        {
-            unsigned int cmpBlockInBytes = 0;
-            for(int i=0; i<=thread_id; i++) cmpBlockInBytes += threadOfs[i];
-            *cmpSize = (size_t)(cmpBlockInBytes + block_num * NUM_THREADS);
+
+        // last thread writes total compressed size
+        if (tid == THREAD_COUNT - 1) {
+            unsigned int sum = 0;
+            for (int t = 0; t < THREAD_COUNT; t++)
+                sum += threadOfs[t];
+            *cmpSize = sum + totalBlocks;
         }
     }
 }
 
-void hawkZip_decompress_kernel(float* decData, unsigned char* cmpData, int* absQuant, int* fixedRate, unsigned int* threadOfs, size_t nbEle, float errorBound)
+
+// --- decompress kernel with delta‑decode ---
+void hawkZip_decompress_kernel(
+    float* decData,
+    unsigned char* cmpData,
+    int* absQuant,
+    int* fixedRate,
+    unsigned int* threadOfs,
+    size_t nbEle,
+    float errorBound)
 {
-    // Shared variables across threads.
-    int chunk_size = (nbEle + NUM_THREADS - 1) / NUM_THREADS;
-    omp_set_num_threads(NUM_THREADS);
-    
-    // hawkZip parallel decompression begin.
+    int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int chunk_size  = (nbEle + THREAD_COUNT - 1) / THREAD_COUNT;
+    omp_set_num_threads(THREAD_COUNT);
+
     #pragma omp parallel
     {
-        // Divide data chunk for each thread
-        int thread_id = omp_get_thread_num();
-        int start = thread_id * chunk_size;
-        int end = start + chunk_size;
-        if(end > nbEle) end = nbEle;
-        int block_num = (chunk_size+31)/32;
-        int block_start, block_end;
-        int start_block = thread_id * block_num;
-        unsigned int thread_ofs = 0;
+        int tid        = omp_get_thread_num();
+        int startElem  = tid * chunk_size;
+        int endElem    = startElem + chunk_size;
+        if (endElem > (int)nbEle) endElem = nbEle;
 
+        int perThread  = (totalBlocks + THREAD_COUNT - 1) / THREAD_COUNT;
+        int startBlock = tid * perThread;
+        unsigned int local_ofs = 0;
 
-        // Iterate all blocks in current thread.
-        for(int i=0; i<block_num; i++)
-        {
-            // Retrieve fixed-rate for each block in the compressed data.
-            int curr_block = start_block + i;
-            int temp_fixed_rate = (int)cmpData[curr_block];
-            fixedRate[curr_block] = temp_fixed_rate;
-
-            // Inner thread prefix-sum.
-            thread_ofs += temp_fixed_rate ? (32+temp_fixed_rate*32)/8 : 0;
+        // 1) read per‑block rates
+        for (int b = 0; b < perThread; b++) {
+            int g = startBlock + b;
+            if (g >= totalBlocks) break;
+            int rate = (int)cmpData[g];
+            fixedRate[g] = rate;
+            if (rate)
+                local_ofs += (BLOCK_SIZE + rate * BLOCK_SIZE) / 8;
         }
-
-        // Store thread ofs to global varaible, used for later global prefix-sum.
-        threadOfs[thread_id] = thread_ofs;
+        threadOfs[tid] = local_ofs;
         #pragma omp barrier
 
-        // Exclusive prefix-sum.
-        unsigned int global_ofs = 0;
-        for(int i=0; i<thread_id; i++) global_ofs += threadOfs[i];
-        unsigned int cmp_byte_ofs = global_ofs + block_num * NUM_THREADS;
+        // 2) prefix‑sum to get read offset
+        unsigned int offs = 0;
+        for (int t = 0; t < tid; t++)
+            offs += threadOfs[t];
+        unsigned int read_ptr = offs + totalBlocks;
 
-        // Restore decompressed data.
-        for(int i=0; i<block_num; i++)
-        {
-            // Block initialization.
-            block_start = start + i * 32;
-            block_end = (block_start+32) > end ? end : block_start+32;
-            int curr_block = start_block + i;
-            int temp_fixed_rate = fixedRate[curr_block];
-            unsigned int sign_flag = 0;
-            int sign_ofs;
+        // 3) unpack ‑ decode deltas into absQuant
+        for (int b = 0; b < perThread; b++) {
+            int g = startBlock + b;
+            if (g >= totalBlocks) break;
+            int rate = fixedRate[g];
+            if (!rate) continue;
 
-            // Operation for each block, if zero block then do nothing.
-            if(temp_fixed_rate)
-            {
-                // Retrieve sign information for one block.
-                sign_flag = (0xff000000 & (cmpData[cmp_byte_ofs++] << 24)) |
-                            (0x00ff0000 & (cmpData[cmp_byte_ofs++] << 16)) |
-                            (0x0000ff00 & (cmpData[cmp_byte_ofs++] << 8))  |
-                            (0x000000ff & cmpData[cmp_byte_ofs++]);
+            // read sign flag
+            unsigned int sflag = 0;
+            for (int byte = 3; byte >= 0; byte--)
+                sflag |= ((unsigned int)cmpData[read_ptr++])
+                         << (8 * byte);
 
-                // Retrieve quant data for one block.
-                unsigned char tmp_char0, tmp_char1, tmp_char2, tmp_char3;
-                for(int j=0; j<temp_fixed_rate; j++)
-                {
-                    // Initialization.
-                    tmp_char0 = cmpData[cmp_byte_ofs++];
-                    tmp_char1 = cmpData[cmp_byte_ofs++];
-                    tmp_char2 = cmpData[cmp_byte_ofs++];
-                    tmp_char3 = cmpData[cmp_byte_ofs++];
+            int bs = g * BLOCK_SIZE;
+            int be = bs + BLOCK_SIZE;
+            if (be > (int)nbEle) be = nbEle;
+            unsigned int mask = 1;
 
-                    // Get ith bit in 0~7 abs quant from global memory.
-                    for(int k=block_start; k<block_start+8; k++)
-                        absQuant[k] |= ((tmp_char0 >> (7+block_start-k)) & 0x00000001) << j;
+            // clear absQuant for this block
+            for (int i = bs; i < be; i++) absQuant[i] = 0;
 
-                    // Get ith bit in 8~15 abs quant from global memory.
-                    for(int k=block_start+8; k<block_start+16; k++)
-                        absQuant[k] |= ((tmp_char1 >> (15+block_start-k)) & 0x00000001) << j;
-
-                    // Get ith bit in 16-23 abs quant from global memory.
-                    for(int k=block_start+16; k<block_start+24; k++)
-                        absQuant[k] |= ((tmp_char2 >> (23+block_start-k)) & 0x00000001) << j;
-
-                    // Get ith bit in 24-31 abs quant from global memory.
-                    for(int k=block_start+24; k<block_end; k++)
-                        absQuant[k] |= ((tmp_char3 >> (31+block_start-k)) & 0x00000001) << j;
+            // read bitplanes
+            for (int bit = 0; bit < rate; bit++) {
+                for (int chunk = 0; chunk < BLOCK_SIZE; chunk += 8) {
+                    unsigned char packed = cmpData[read_ptr++];
+                    int limit = ((bs + chunk + 8) > be)
+                                ? (be - (bs + chunk)) : 8;
+                    for (int k = 0; k < limit; k++) {
+                        absQuant[bs + chunk + k] |=
+                          ((packed >> (7 - k)) & 1) << bit;
+                    }
                 }
+                mask <<= 1;
+            }
 
-                // De-quantize and store data back to decompression data.
-                int currQuant;
-                for(int i=block_start; i<block_end; i++)
-                {
-                    sign_ofs = i % 32;
-                    if(sign_flag & (1 << (31 - sign_ofs)))
-                        currQuant = absQuant[i] * -1;
-                    else
-                        currQuant = absQuant[i];
-                    decData[i] = currQuant * errorBound * 2;
-                }
+            // 4) delta‑decode + dequantize into decData
+            int prevQ = 0;
+            for (int i = bs; i < be; i++) {
+                int sign = (sflag >> (BLOCK_SIZE - 1 - (i % BLOCK_SIZE))) & 1;
+                int d = sign ? -absQuant[i] : absQuant[i];
+                if (i == bs) prevQ = d;
+                else          prevQ += d;
+                decData[i] = prevQ * errorBound * 2;
             }
         }
     }
 }
+
