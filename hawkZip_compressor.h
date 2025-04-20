@@ -12,26 +12,7 @@
 #define BLOCK_SIZE 32
 #endif
 
-// prototypes
-void hawkZip_compress_kernel(
-    float* oriData,
-    unsigned char* cmpData,
-    int* absQuant,
-    unsigned int* signFlag,
-    int* fixedRate,
-    unsigned int* threadOfs,
-    size_t nbEle,
-    size_t* cmpSize,
-    float errorBound);
 
-void hawkZip_decompress_kernel(
-    float* decData,
-    unsigned char* cmpData,
-    int* absQuant,
-    int* fixedRate,
-    unsigned int* threadOfs,
-    size_t nbEle,
-    float errorBound);
 
 
 // --- compress kernel with block‑local delta encoding ---

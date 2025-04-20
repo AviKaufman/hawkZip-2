@@ -45,7 +45,7 @@ void hawkZip_compress(
     free(zBuf);
 
     *cmpSize = 8 + cSize;
-
+ 
     // 4) print metrics
     printf("hawkZip   compression ratio:      %f\n",
            (float)(sizeof(float)*nbEle)/(float)(*cmpSize));
