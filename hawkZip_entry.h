@@ -50,7 +50,7 @@ void hawkZip_compress(
     printf("hawkZip   compression ratio:      %f\n",
            (float)(sizeof(float)*nbEle)/(float)(*cmpSize));
     printf("hawkZip   compression throughput: %f GB/s\n",
-           (nbEle*sizeof(float)/1e9)/(t1-t0));
+           (nbEle*sizeof(float)/1024.0/1024.0/1024.0)/(t1-t0));
 
     free(absQuant);
     free(signFlag);
@@ -96,7 +96,7 @@ void hawkZip_decompress(
     double t1 = omp_get_wtime();
 
     printf("hawkZip decompression throughput: %f GB/s\n",
-           (nbEle*sizeof(float)/1e9)/(t1-t0));
+           (nbEle*sizeof(float)/1024.0/1024.0/1024.0)/(t1-t0));
 
     free(planeBuf);
     free(absQuant);
