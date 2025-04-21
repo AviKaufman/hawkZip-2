@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# But do not ignore git itself
+!.gitignore
+
+# Only track these two headers
+!hawkZip_compressor.h
+!hawkZip_entry.h
