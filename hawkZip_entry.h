@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <omp.h>
-#include <zstd.h>
+#include <lz4.h>
 #include "hawkZip_compressor.h"
 
 void hawkZip_compress(
@@ -30,19 +30,23 @@ void hawkZip_compress(
 
     int origSize = (int)*cmpSize;
 
-    // 2) Zstd compress the bit‑plane payload
-    unsigned char* zBuf = malloc(ZSTD_compressBound(origSize));
-    size_t cSize = ZSTD_compress(
-        zBuf, ZSTD_compressBound(origSize),
-        cmpData, origSize,
-        42 /* speed vs. ratio level */);
+    // 2) LZ4 compress the bit-plane payload
+    int maxOut = LZ4_compressBound(origSize);
+    unsigned char* lzBuf = malloc((size_t)maxOut);
+    int cSize = LZ4_compress_default(
+        (const char*)cmpData, (char*)lzBuf,
+        origSize, maxOut);
+    if (cSize <= 0) {
+        fprintf(stderr, "LZ4 compression error: %d\n", cSize);
+        exit(1);
+    }
 
     // 3) emit 8‑byte header + Zstd data
     uint32_t* hdr = (uint32_t*)cmpData;
     hdr[0] = (uint32_t)origSize;
     hdr[1] = (uint32_t)cSize;
-    memcpy(cmpData + 8, zBuf, cSize);
-    free(zBuf);
+    memcpy(cmpData + 8, lzBuf, (size_t)cSize);
+    free(lzBuf);
 
     *cmpSize = 8 + cSize;
  
@@ -72,14 +76,13 @@ void hawkZip_decompress(
     uint32_t cSize    = ((uint32_t*)cmpData)[1];
     unsigned char* src = cmpData + 8;
 
-    // 2) Zstd decompress into planeBuf
-    unsigned char* planeBuf = malloc(origSize);
-    size_t dSize = ZSTD_decompress(
-        planeBuf, origSize,
-        src, cSize);
-    if (dSize != origSize) {
-        fprintf(stderr, "ZSTD decompression error: %zu != %u\n",
-                dSize, origSize);
+    // 2) LZ4 decompress into planeBuf
+    unsigned char* planeBuf = malloc((size_t)origSize);
+    int dSize = LZ4_decompress_safe(
+        (const char*)src, (char*)planeBuf,
+        cSize, origSize);
+    if (dSize < 0) {
+        fprintf(stderr, "LZ4 decompression error: %d\n", dSize);
         exit(1);
     }
 
