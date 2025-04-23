@@ -1,8 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <omp.h>
-#include <lz4.h>
+#include <zlib.h>
 #include "hawkZip_compressor.h"
 
 void hawkZip_compress(
@@ -12,7 +13,7 @@ void hawkZip_compress(
     size_t*        cmpSize,
     float          errorBound)
 {
-    // existing delta compressor
+    // Stage 1: existing delta + bit-plane compressor
     int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int*           absQuant  = malloc(sizeof(int)           * nbEle);
     unsigned int*  signFlag  = malloc(sizeof(unsigned int) * totalBlocks);
@@ -30,26 +31,26 @@ void hawkZip_compress(
 
     int origSize = (int)*cmpSize;
 
-    // 2) LZ4 compress the bit-plane payload
-    int maxOut = LZ4_compressBound(origSize);
-    unsigned char* lzBuf = malloc((size_t)maxOut);
-    int cSize = LZ4_compress_default(
-        (const char*)cmpData, (char*)lzBuf,
-        origSize, maxOut);
-    if (cSize <= 0) {
-        fprintf(stderr, "LZ4 compression error: %d\n", cSize);
+    // Stage 2: DEFLATE (zlib) compress the bit-plane payload
+    uLongf destLen = compressBound((uLong)origSize);
+    unsigned char* defBuf = malloc(destLen);
+    int zret = compress(
+        defBuf, &destLen,
+        cmpData, (uLong)origSize);
+    if (zret != Z_OK) {
+        fprintf(stderr, "zlib compress error: %d\n", zret);
         exit(1);
     }
 
-    // 3) emit 8‑byte header + Zstd data
+    // 3) emit 8-byte header + DEFLATE data
     uint32_t* hdr = (uint32_t*)cmpData;
     hdr[0] = (uint32_t)origSize;
-    hdr[1] = (uint32_t)cSize;
-    memcpy(cmpData + 8, lzBuf, (size_t)cSize);
-    free(lzBuf);
+    hdr[1] = (uint32_t)destLen;
+    memcpy(cmpData + 8, defBuf, destLen);
+    free(defBuf);
 
-    *cmpSize = 8 + cSize;
- 
+    *cmpSize = 8 + destLen;
+
     // 4) print metrics
     printf("hawkZip   compression ratio:      %f\n",
            (float)(sizeof(float)*nbEle)/(float)(*cmpSize));
@@ -76,17 +77,18 @@ void hawkZip_decompress(
     uint32_t cSize    = ((uint32_t*)cmpData)[1];
     unsigned char* src = cmpData + 8;
 
-    // 2) LZ4 decompress into planeBuf
+    // 2) DEFLATE (zlib) decompress into planeBuf
     unsigned char* planeBuf = malloc((size_t)origSize);
-    int dSize = LZ4_decompress_safe(
-        (const char*)src, (char*)planeBuf,
-        cSize, origSize);
-    if (dSize < 0) {
-        fprintf(stderr, "LZ4 decompression error: %d\n", dSize);
+    uLongf outLen = (uLongf)origSize;
+    int zret = uncompress(
+        planeBuf, &outLen,
+        src, (uLong)cSize);
+    if (zret != Z_OK || outLen != (uLongf)origSize) {
+        fprintf(stderr, "zlib uncompress error: %d (got %lu)\n", zret, outLen);
         exit(1);
     }
 
-    // 3) your existing delta‑unpack decompressor
+    // 3) existing delta-unpack decompressor
     int*           absQuant  = calloc(nbEle, sizeof(int));
     int*           fixedRate = malloc(sizeof(int) * totalBlocks);
     unsigned int*  threadOfs = malloc(sizeof(unsigned int) * THREAD_COUNT);
