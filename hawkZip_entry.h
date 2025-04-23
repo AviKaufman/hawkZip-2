@@ -1,9 +1,10 @@
+// hawkZip_entry.h
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <omp.h>
-#include <zlib.h>
+#include <blosc.h>
 #include "hawkZip_compressor.h"
 
 void hawkZip_compress(
@@ -31,25 +32,33 @@ void hawkZip_compress(
 
     int origSize = (int)*cmpSize;
 
-    // Stage 2: DEFLATE (zlib) compress the bit-plane payload
-    uLongf destLen = compressBound((uLong)origSize);
-    unsigned char* defBuf = malloc(destLen);
-    int zret = compress(
-        defBuf, &destLen,
-        cmpData, (uLong)origSize);
-    if (zret != Z_OK) {
-        fprintf(stderr, "zlib compress error: %d\n", zret);
+    // Stage 2: Blosc compress the bit-plane payload
+    blosc_init();
+    size_t  destCap  = (size_t)origSize + BLOSC_MAX_OVERHEAD;
+    unsigned char* bloscBuf = malloc(destCap);
+    int cSize = blosc_compress(
+        /*clevel=*/5,
+        /*doshuffle=*/BLOSC_SHUFFLE,
+        /*typesize=*/1,
+        /*nbytes=*/(size_t)origSize,
+        /*src=*/cmpData,
+        /*dest=*/bloscBuf,
+        /*destsize=*/destCap
+    );
+    if (cSize <= 0) {
+        fprintf(stderr, "Blosc compress error: %d\n", cSize);
         exit(1);
     }
+    blosc_destroy();
 
-    // 3) emit 8-byte header + DEFLATE data
+    // 3) emit 8-byte header + Blosc data
     uint32_t* hdr = (uint32_t*)cmpData;
     hdr[0] = (uint32_t)origSize;
-    hdr[1] = (uint32_t)destLen;
-    memcpy(cmpData + 8, defBuf, destLen);
-    free(defBuf);
+    hdr[1] = (uint32_t)cSize;
+    memcpy(cmpData + 8, bloscBuf, (size_t)cSize);
+    free(bloscBuf);
 
-    *cmpSize = 8 + destLen;
+    *cmpSize = 8 + cSize;
 
     // 4) print metrics
     printf("hawkZip   compression ratio:      %f\n",
@@ -69,7 +78,6 @@ void hawkZip_decompress(
     size_t         nbEle,
     float          errorBound)
 {
-    // compute totalBlocks here
     int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // 1) peel off header
@@ -77,16 +85,19 @@ void hawkZip_decompress(
     uint32_t cSize    = ((uint32_t*)cmpData)[1];
     unsigned char* src = cmpData + 8;
 
-    // 2) DEFLATE (zlib) decompress into planeBuf
+    // 2) Blosc decompress into planeBuf
+    blosc_init();
     unsigned char* planeBuf = malloc((size_t)origSize);
-    uLongf outLen = (uLongf)origSize;
-    int zret = uncompress(
-        planeBuf, &outLen,
-        src, (uLong)cSize);
-    if (zret != Z_OK || outLen != (uLongf)origSize) {
-        fprintf(stderr, "zlib uncompress error: %d (got %lu)\n", zret, outLen);
+    long dSize = blosc_decompress(
+        /*src=*/src,
+        /*dest=*/planeBuf,
+        /*destsize=*/(size_t)origSize
+    );
+    if (dSize <= 0) {
+        fprintf(stderr, "Blosc decompress error: %ld\n", dSize);
         exit(1);
     }
+    blosc_destroy();
 
     // 3) existing delta-unpack decompressor
     int*           absQuant  = calloc(nbEle, sizeof(int));
