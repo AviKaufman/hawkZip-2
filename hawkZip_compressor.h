@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h> // For uintptr_t
 
 #include <omp.h>
 
@@ -34,6 +35,10 @@ void hawkZip_compress_kernel(
     
     int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int chunk_size  = (nbEle + THREAD_COUNT - 1) / THREAD_COUNT;
+    
+    // Precompute quantization factor for better performance
+    const float inv_err_bound = 0.5f / errorBound;
+    
     omp_set_num_threads(THREAD_COUNT);
 
     #pragma omp parallel
@@ -46,6 +51,9 @@ void hawkZip_compress_kernel(
         int perThread  = (totalBlocks + THREAD_COUNT - 1) / THREAD_COUNT;
         int startBlock = tid * perThread;
         unsigned int local_ofs = 0;
+
+        // Allocate qBuf on stack once per thread
+        int qBuf[BLOCK_SIZE];
 
         // each block
         for (int b = 0; b < perThread; b++) {
@@ -57,35 +65,46 @@ void hawkZip_compress_kernel(
             if (be > (int)nbEle) be = nbEle;
             int len = be - bs;
 
-            // 1) quantize into a small local buffer - UNROLLED BY 4
-            int qBuf[BLOCK_SIZE];
-            float inv_err_bound = 0.5f / errorBound;
-            
+            // 1) quantize into a small local buffer - UNROLLED BY 8
             int i = 0;
-            // Process blocks of 4 elements at a time
-            for (; i < len - 3; i += 4) {
-                // Element 1
-                float r1 = oriData[bs + i] * inv_err_bound;
+            
+            // Process blocks of 8 elements at a time
+            for (; i <= len - 8; i += 8) {
+                const float* data_ptr = oriData + bs + i;
+                
+                // Prefetch next chunk of data for better memory access pattern
+                __builtin_prefetch(data_ptr + 8, 0, 1);
+                
+                // Process 8 elements in parallel
+                float r1 = data_ptr[0] * inv_err_bound;
+                float r2 = data_ptr[1] * inv_err_bound;
+                float r3 = data_ptr[2] * inv_err_bound;
+                float r4 = data_ptr[3] * inv_err_bound;
+                float r5 = data_ptr[4] * inv_err_bound;
+                float r6 = data_ptr[5] * inv_err_bound;
+                float r7 = data_ptr[6] * inv_err_bound;
+                float r8 = data_ptr[7] * inv_err_bound;
+                
                 int sign1 = (r1 < -0.5f);
-                qBuf[i] = (int)(r1 + 0.5f) - sign1;
-                
-                // Element 2
-                float r2 = oriData[bs + i + 1] * inv_err_bound;
                 int sign2 = (r2 < -0.5f);
-                qBuf[i + 1] = (int)(r2 + 0.5f) - sign2;
-                
-                // Element 3
-                float r3 = oriData[bs + i + 2] * inv_err_bound;
                 int sign3 = (r3 < -0.5f);
-                qBuf[i + 2] = (int)(r3 + 0.5f) - sign3;
-                
-                // Element 4
-                float r4 = oriData[bs + i + 3] * inv_err_bound;
                 int sign4 = (r4 < -0.5f);
+                int sign5 = (r5 < -0.5f);
+                int sign6 = (r6 < -0.5f);
+                int sign7 = (r7 < -0.5f);
+                int sign8 = (r8 < -0.5f);
+                
+                qBuf[i]     = (int)(r1 + 0.5f) - sign1;
+                qBuf[i + 1] = (int)(r2 + 0.5f) - sign2;
+                qBuf[i + 2] = (int)(r3 + 0.5f) - sign3;
                 qBuf[i + 3] = (int)(r4 + 0.5f) - sign4;
+                qBuf[i + 4] = (int)(r5 + 0.5f) - sign5;
+                qBuf[i + 5] = (int)(r6 + 0.5f) - sign6;
+                qBuf[i + 6] = (int)(r7 + 0.5f) - sign7;
+                qBuf[i + 7] = (int)(r8 + 0.5f) - sign8;
             }
             
-            // Handle remaining elements
+            // Handle remaining elements with original method
             for (; i < len; i++) {
                 float r = oriData[bs + i] * inv_err_bound;
                 int sign = (r < -0.5f);
@@ -96,25 +115,63 @@ void hawkZip_compress_kernel(
             unsigned int sflag = 0;
             int max_q = 0;
 
-            // element 0
+            // Fast path for first element
             int delta0 = qBuf[0];
             int a0 = delta0 < 0 ? -delta0 : delta0;
             absQuant[bs] = a0;
             
-            // Replace modulo with bitwise AND
+            // Use bit operations instead of modulo
             int bit_position = BLOCK_SIZE - 1 - (bs & BLOCK_MASK);
             sflag |= (unsigned int)(delta0 < 0) << bit_position;
             
             if (a0 > max_q) max_q = a0;
             int prev = qBuf[0];
 
-            // the rest
-            for (int i = 1; i < len; i++) {
+            // Delta encode the rest with unrolling where possible
+            i = 1;
+            // Process blocks of 4 elements at a time for delta encoding
+            for (; i <= len - 4; i += 4) {
+                // Element 1
+                int d1 = qBuf[i] - prev;
+                int ad1 = d1 < 0 ? -d1 : d1;
+                absQuant[bs + i] = ad1;
+                bit_position = BLOCK_SIZE - 1 - ((bs + i) & BLOCK_MASK);
+                sflag |= (unsigned int)(d1 < 0) << bit_position;
+                if (ad1 > max_q) max_q = ad1;
+                
+                // Element 2
+                int d2 = qBuf[i+1] - qBuf[i];
+                int ad2 = d2 < 0 ? -d2 : d2;
+                absQuant[bs + i + 1] = ad2;
+                bit_position = BLOCK_SIZE - 1 - ((bs + i + 1) & BLOCK_MASK);
+                sflag |= (unsigned int)(d2 < 0) << bit_position;
+                if (ad2 > max_q) max_q = ad2;
+                
+                // Element 3
+                int d3 = qBuf[i+2] - qBuf[i+1];
+                int ad3 = d3 < 0 ? -d3 : d3;
+                absQuant[bs + i + 2] = ad3;
+                bit_position = BLOCK_SIZE - 1 - ((bs + i + 2) & BLOCK_MASK);
+                sflag |= (unsigned int)(d3 < 0) << bit_position;
+                if (ad3 > max_q) max_q = ad3;
+                
+                // Element 4
+                int d4 = qBuf[i+3] - qBuf[i+2];
+                int ad4 = d4 < 0 ? -d4 : d4;
+                absQuant[bs + i + 3] = ad4;
+                bit_position = BLOCK_SIZE - 1 - ((bs + i + 3) & BLOCK_MASK);
+                sflag |= (unsigned int)(d4 < 0) << bit_position;
+                if (ad4 > max_q) max_q = ad4;
+                
+                prev = qBuf[i+3];
+            }
+
+            // Handle remaining elements
+            for (; i < len; i++) {
                 int d = qBuf[i] - prev;
                 int ad = d < 0 ? -d : d;
                 absQuant[bs + i] = ad;
                 
-                // Replace modulo with bitwise AND
                 bit_position = BLOCK_SIZE - 1 - ((bs + i) & BLOCK_MASK);
                 sflag |= (unsigned int)(d < 0) << bit_position;
                 
@@ -124,12 +181,10 @@ void hawkZip_compress_kernel(
 
             signFlag[g] = sflag;
 
-            // 3) determine bit‑width
-            int rate = max_q
-                       ? ((int)(sizeof(int)*8) - __builtin_clz(max_q))
-                       : 0;
+            // 3) determine bit‑width using fast intrinsic
+            int rate = max_q ? ((int)(sizeof(int)*8) - __builtin_clz(max_q)) : 0;
             fixedRate[g] = rate;
-            cmpData[g]   = (unsigned char)rate;
+            cmpData[g] = (unsigned char)rate;
 
             if (rate)
                 local_ofs += (BLOCK_SIZE + rate * BLOCK_SIZE) / 8;
@@ -138,13 +193,13 @@ void hawkZip_compress_kernel(
         threadOfs[tid] = local_ofs;
         #pragma omp barrier
 
-        // prefix-sum to compute write offset
+        // prefix-sum to compute write offset (unmodified)
         unsigned int offs = 0;
         for (int t = 0; t < tid; t++)
             offs += threadOfs[t];
         unsigned int write_ptr = offs + totalBlocks;
 
-        // bit‑plane pack the deltas
+        // 4) bit‑plane pack the deltas - improved with prefetching and better memory access
         for (int b = 0; b < perThread; b++) {
             int g = startBlock + b;
             if (g >= totalBlocks) break;
@@ -152,33 +207,45 @@ void hawkZip_compress_kernel(
             if (!rate) continue;
 
             unsigned int sflag = signFlag[g];
-            // write 4‑byte sign flag
-            for (int byte = 3; byte >= 0; byte--)
-                cmpData[write_ptr++] =
-                  (sflag >> (8 * byte)) & 0xFF;
+            // write 4‑byte sign flag (optimized byte order write)
+            cmpData[write_ptr++] = (sflag >> 24) & 0xFF;
+            cmpData[write_ptr++] = (sflag >> 16) & 0xFF;
+            cmpData[write_ptr++] = (sflag >> 8) & 0xFF;
+            cmpData[write_ptr++] = sflag & 0xFF;
 
-            // write bitplanes of absQuant[bs..be)
+            // write bitplanes of absQuant[bs..be) - prefetch to improve memory access
             int bs = g * BLOCK_SIZE;
             int be = bs + BLOCK_SIZE;
             if (be > (int)nbEle) be = nbEle;
-            unsigned int mask = 1;
+            
+            // Prefetch absQuant data for better cache performance
+            for (int i = bs; i < be; i += 16) {
+                __builtin_prefetch(absQuant + i, 0, 3);
+            }
+            
             for (int bit = 0; bit < rate; bit++) {
+                const unsigned int mask = 1U << bit;
                 for (int chunk = 0; chunk < BLOCK_SIZE; chunk += 8) {
                     unsigned char packed = 0;
-                    int limit = ((bs + chunk + 8) > be)
-                                ? (be - (bs + chunk)) : 8;
-                    for (int k = 0; k < limit; k++) {
-                        packed |=
-                          ((absQuant[bs + chunk + k] & mask) >> bit)
-                          << (7 - k);
+                    int limit = ((bs + chunk + 8) > be) ? (be - (bs + chunk)) : 8;
+                    
+                    // Fast path for full chunks (most common case)
+                    if (limit == 8) {
+                        for (int k = 0; k < 8; k++) {
+                            packed |= ((absQuant[bs + chunk + k] & mask) >> bit) << (7 - k);
+                        }
+                    } else {
+                        // Partial chunk (end of block)
+                        for (int k = 0; k < limit; k++) {
+                            packed |= ((absQuant[bs + chunk + k] & mask) >> bit) << (7 - k);
+                        }
                     }
                     cmpData[write_ptr++] = packed;
                 }
-                mask <<= 1;
             }
         }
 
-        // last thread writes total compressed size
+        // last thread writes total compressed size (unmodified)
         if (tid == THREAD_COUNT - 1) {
             unsigned int sum = 0;
             for (int t = 0; t < THREAD_COUNT; t++)
@@ -189,93 +256,104 @@ void hawkZip_compress_kernel(
 }
 
 
-// --- decompress kernel with delta‑decode ---
 void hawkZip_decompress_kernel(
     float* decData,
-    unsigned char* cmpData,
+    const unsigned char* cmpData, // Added const
     int* absQuant,
     int* fixedRate,
     unsigned int* threadOfs,
-    size_t nbEle,
-    float errorBound)
+    const size_t nbEle,          // Added const
+    const float errorBound)      // Added const
 {
-    int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    int chunk_size  = (nbEle + THREAD_COUNT - 1) / THREAD_COUNT;
+    if (nbEle == 0) return;
+
+    const int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
     omp_set_num_threads(THREAD_COUNT);
+
+    // Optimization 1: Precompute dequantization factor
+    const float dequant_factor = errorBound * 2.0f;
 
     #pragma omp parallel
     {
-        int tid        = omp_get_thread_num();
-        int startElem  = tid * chunk_size;
-        int endElem    = startElem + chunk_size;
-        if (endElem > (int)nbEle) endElem = nbEle;
+        const int tid = omp_get_thread_num();
 
-        int perThread  = (totalBlocks + THREAD_COUNT - 1) / THREAD_COUNT;
-        int startBlock = tid * perThread;
+        const int perThread  = (totalBlocks + THREAD_COUNT - 1) / THREAD_COUNT;
+        const int startBlock = tid * perThread;
         unsigned int local_ofs = 0;
 
-        // 1) read per‑block rates
-        for (int b = 0; b < perThread; b++) {
-            int g = startBlock + b;
+        // 1) read per‑block rates (Keep original logic)
+        for (int b = 0; b < perThread; ++b) {
+            const int g = startBlock + b;
             if (g >= totalBlocks) break;
-            int rate = (int)cmpData[g];
+            const int rate = (int)cmpData[g];
             fixedRate[g] = rate;
-            if (rate)
+            if (rate) {
+                // *** KEEP THE ORIGINAL OFFSET CALCULATION ***
                 local_ofs += (BLOCK_SIZE + rate * BLOCK_SIZE) / 8;
+            }
         }
         threadOfs[tid] = local_ofs;
-        #pragma omp barrier
+        #pragma omp barrier // Barrier essential for prefix sum
 
-        // 2) prefix‑sum to get read offset
+        // 2) prefix‑sum to get read offset (Keep original logic)
         unsigned int offs = 0;
-        for (int t = 0; t < tid; t++)
+        for (int t = 0; t < tid; ++t) {
             offs += threadOfs[t];
+        }
         unsigned int read_ptr = offs + totalBlocks;
 
-        // 3) unpack ‑ decode deltas into absQuant
-        for (int b = 0; b < perThread; b++) {
-            int g = startBlock + b;
+        // 3) unpack (Keep most original logic)
+        for (int b = 0; b < perThread; ++b) {
+            const int g = startBlock + b;
             if (g >= totalBlocks) break;
-            int rate = fixedRate[g];
+
+            const int rate = fixedRate[g];
             if (!rate) continue;
 
-            // read sign flag
+            // read sign flag (Keep original logic)
             unsigned int sflag = 0;
-            for (int byte = 3; byte >= 0; byte--)
-                sflag |= ((unsigned int)cmpData[read_ptr++])
-                         << (8 * byte);
+            for (int byte = 3; byte >= 0; --byte) {
+                 sflag |= ((unsigned int)cmpData[read_ptr++]) << (8 * byte);
+            }
 
-            int bs = g * BLOCK_SIZE;
-            int be = bs + BLOCK_SIZE;
-            if (be > (int)nbEle) be = nbEle;
-            unsigned int mask = 1;
+            const int bs = g * BLOCK_SIZE;
+            const int be = ((bs + BLOCK_SIZE) > (int)nbEle) ? (int)nbEle : (bs + BLOCK_SIZE);
+            const int block_elem_count = be - bs;
 
-            // clear absQuant for this block
-            for (int i = bs; i < be; i++) absQuant[i] = 0;
+            if (block_elem_count <= 0) continue;
 
-            // read bitplanes
-            for (int bit = 0; bit < rate; bit++) {
-                for (int chunk = 0; chunk < BLOCK_SIZE; chunk += 8) {
-                    unsigned char packed = cmpData[read_ptr++];
-                    int limit = ((bs + chunk + 8) > be)
-                                ? (be - (bs + chunk)) : 8;
-                    for (int k = 0; k < limit; k++) {
-                        absQuant[bs + chunk + k] |=
-                          ((packed >> (7 - k)) & 1) << bit;
-                    }
+            // Optimization 2: Use memset to clear absQuant for the current block
+            memset(absQuant + bs, 0, (size_t)block_elem_count * sizeof(int));
+
+            // read bitplanes (Keep original logic)
+            for (int bit = 0; bit < rate; ++bit) {
+                for (int chunk_offset = 0; chunk_offset < block_elem_count; chunk_offset += 8) {
+                     const unsigned char packed = cmpData[read_ptr++];
+                     const int limit = ((chunk_offset + 8) > block_elem_count) ? (block_elem_count - chunk_offset) : 8;
+                     const int current_block_elem_start = bs + chunk_offset;
+                     for (int k = 0; k < limit; ++k) {
+                         // Original bit unpacking logic:
+                         absQuant[current_block_elem_start + k] |=
+                           ((packed >> (7 - k)) & 1) << bit;
+                     }
                 }
-                mask <<= 1;
             }
 
-            // 4) delta‑decode + dequantize into decData
+            // 4) delta‑decode + dequantize into decData (Keep original logic, use precomputed factor)
             int prevQ = 0;
-            for (int i = bs; i < be; i++) {
-                int sign = (sflag >> (BLOCK_SIZE - 1 - (i % BLOCK_SIZE))) & 1;
-                int d = sign ? -absQuant[i] : absQuant[i];
-                if (i == bs) prevQ = d;
-                else          prevQ += d;
-                decData[i] = prevQ * errorBound * 2;
+            for (int i = bs; i < be; ++i) {
+                const int sign = (sflag >> (BLOCK_SIZE - 1 - (i % BLOCK_SIZE))) & 1;
+                const int q_mag = absQuant[i];
+                const int d = sign ? -q_mag : q_mag;
+
+                if (i == bs) {
+                    prevQ = d;
+                } else {
+                    prevQ += d;
+                }
+                // Use precomputed factor (Optimization 1 applied here)
+                decData[i] = (float)prevQ * dequant_factor;
             }
-        }
-    }
+        } // End loop over blocks (b)
+    } // End parallel region
 }
