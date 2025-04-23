@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h> // For uintptr_t
-
+#include <emmintrin.h>
 #include <omp.h>
 
 // fixed at 32
@@ -15,14 +15,14 @@
 
 // --- compress kernel with block‑local delta encoding ---
 void hawkZip_compress_kernel(
-    float* oriData,
-    unsigned char* cmpData,
-    int* absQuant,
-    unsigned int* signFlag,
-    int* fixedRate,
-    unsigned int* threadOfs,
+    float* __restrict oriData,
+    unsigned char* __restrict cmpData,
+    int*  __restrict absQuant,
+    unsigned int* __restrict signFlag,
+    int* __restrict fixedRate,
+    unsigned int*  __restrict threadOfs,
     size_t nbEle,
-    size_t* cmpSize,
+    size_t* __restrict cmpSize,
     float errorBound)
 {
     // Make sure BLOCK_SIZE is a power of 2 for bitwise optimization
@@ -53,7 +53,7 @@ void hawkZip_compress_kernel(
         unsigned int local_ofs = 0;
 
         // Allocate qBuf on stack once per thread
-        int qBuf[BLOCK_SIZE];
+        int qBuf[BLOCK_SIZE] __attribute__((aligned(32)));;
 
         // each block
         for (int b = 0; b < perThread; b++) {
