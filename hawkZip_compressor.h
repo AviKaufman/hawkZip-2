@@ -12,9 +12,6 @@
 #define BLOCK_SIZE 32
 #endif
 
-
-
-
 // --- compress kernel with block‑local delta encoding ---
 void hawkZip_compress_kernel(
     float* oriData,
@@ -27,6 +24,14 @@ void hawkZip_compress_kernel(
     size_t* cmpSize,
     float errorBound)
 {
+    // Make sure BLOCK_SIZE is a power of 2 for bitwise optimization
+    #if ((BLOCK_SIZE & (BLOCK_SIZE - 1)) != 0)
+    #error "BLOCK_SIZE must be a power of 2 for bitwise optimization"
+    #endif
+    
+    // Define bit mask for modulo operations
+    const int BLOCK_MASK = BLOCK_SIZE - 1;
+    
     int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int chunk_size  = (nbEle + THREAD_COUNT - 1) / THREAD_COUNT;
     omp_set_num_threads(THREAD_COUNT);
@@ -52,13 +57,39 @@ void hawkZip_compress_kernel(
             if (be > (int)nbEle) be = nbEle;
             int len = be - bs;
 
-            // 1) quantize into a small local buffer
+            // 1) quantize into a small local buffer - UNROLLED BY 4
             int qBuf[BLOCK_SIZE];
-            for (int i = 0; i < len; i++) {
-                float r = oriData[bs + i] * (0.5f / errorBound);
+            float inv_err_bound = 0.5f / errorBound;
+            
+            int i = 0;
+            // Process blocks of 4 elements at a time
+            for (; i < len - 3; i += 4) {
+                // Element 1
+                float r1 = oriData[bs + i] * inv_err_bound;
+                int sign1 = (r1 < -0.5f);
+                qBuf[i] = (int)(r1 + 0.5f) - sign1;
+                
+                // Element 2
+                float r2 = oriData[bs + i + 1] * inv_err_bound;
+                int sign2 = (r2 < -0.5f);
+                qBuf[i + 1] = (int)(r2 + 0.5f) - sign2;
+                
+                // Element 3
+                float r3 = oriData[bs + i + 2] * inv_err_bound;
+                int sign3 = (r3 < -0.5f);
+                qBuf[i + 2] = (int)(r3 + 0.5f) - sign3;
+                
+                // Element 4
+                float r4 = oriData[bs + i + 3] * inv_err_bound;
+                int sign4 = (r4 < -0.5f);
+                qBuf[i + 3] = (int)(r4 + 0.5f) - sign4;
+            }
+            
+            // Handle remaining elements
+            for (; i < len; i++) {
+                float r = oriData[bs + i] * inv_err_bound;
                 int sign = (r < -0.5f);
-                int q = (int)(r + 0.5f) - sign;
-                qBuf[i] = q;
+                qBuf[i] = (int)(r + 0.5f) - sign;
             }
 
             // 2) delta‑encode Q into absQuant[], build new signFlag
@@ -69,8 +100,11 @@ void hawkZip_compress_kernel(
             int delta0 = qBuf[0];
             int a0 = delta0 < 0 ? -delta0 : delta0;
             absQuant[bs] = a0;
-            sflag |= (unsigned int)(delta0 < 0)
-                     << (BLOCK_SIZE - 1 - (bs % BLOCK_SIZE));
+            
+            // Replace modulo with bitwise AND
+            int bit_position = BLOCK_SIZE - 1 - (bs & BLOCK_MASK);
+            sflag |= (unsigned int)(delta0 < 0) << bit_position;
+            
             if (a0 > max_q) max_q = a0;
             int prev = qBuf[0];
 
@@ -79,8 +113,11 @@ void hawkZip_compress_kernel(
                 int d = qBuf[i] - prev;
                 int ad = d < 0 ? -d : d;
                 absQuant[bs + i] = ad;
-                sflag |= (unsigned int)(d < 0)
-                         << (BLOCK_SIZE - 1 - ((bs + i) % BLOCK_SIZE));
+                
+                // Replace modulo with bitwise AND
+                bit_position = BLOCK_SIZE - 1 - ((bs + i) & BLOCK_MASK);
+                sflag |= (unsigned int)(d < 0) << bit_position;
+                
                 if (ad > max_q) max_q = ad;
                 prev = qBuf[i];
             }
@@ -242,4 +279,3 @@ void hawkZip_decompress_kernel(
         }
     }
 }
-
