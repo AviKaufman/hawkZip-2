@@ -4,6 +4,7 @@
 #include <stdint.h> // For uintptr_t
 #include <emmintrin.h>
 #include <omp.h>
+#include <immintrin.h> // For AVX intrinsics
 
 // fixed at 32
 #ifndef THREAD_COUNT
@@ -15,14 +16,14 @@
 
 // --- compress kernel with block‑local delta encoding ---
 void hawkZip_compress_kernel(
-    float* __restrict oriData,
-    unsigned char* __restrict cmpData,
-    int*  __restrict absQuant,
-    unsigned int* __restrict signFlag,
-    int* __restrict fixedRate,
-    unsigned int*  __restrict threadOfs,
+    float* oriData,
+    unsigned char*  cmpData,
+    int*   absQuant,
+    unsigned int*  signFlag,
+    int*  fixedRate,
+    unsigned int*   threadOfs,
     size_t nbEle,
-    size_t* __restrict cmpSize,
+    size_t*  cmpSize,
     float errorBound)
 {
     // Make sure BLOCK_SIZE is a power of 2 for bitwise optimization
@@ -53,7 +54,7 @@ void hawkZip_compress_kernel(
         unsigned int local_ofs = 0;
 
         // Allocate qBuf on stack once per thread
-        int qBuf[BLOCK_SIZE] __attribute__((aligned(32)));;
+        int qBuf[BLOCK_SIZE];
 
         // each block
         for (int b = 0; b < perThread; b++) {
@@ -67,41 +68,22 @@ void hawkZip_compress_kernel(
 
             // 1) quantize into a small local buffer - UNROLLED BY 8
             int i = 0;
+            const __m256 inv_err_vec = _mm256_set1_ps(inv_err_bound);
+            const __m256 half_vec    = _mm256_set1_ps(0.5f);
             
             // Process blocks of 8 elements at a time
             for (; i <= len - 8; i += 8) {
-                const float* data_ptr = oriData + bs + i;
-                
-                // Prefetch next chunk of data for better memory access pattern
-                __builtin_prefetch(data_ptr + 8, 0, 1);
-                
-                // Process 8 elements in parallel
-                float r1 = data_ptr[0] * inv_err_bound;
-                float r2 = data_ptr[1] * inv_err_bound;
-                float r3 = data_ptr[2] * inv_err_bound;
-                float r4 = data_ptr[3] * inv_err_bound;
-                float r5 = data_ptr[4] * inv_err_bound;
-                float r6 = data_ptr[5] * inv_err_bound;
-                float r7 = data_ptr[6] * inv_err_bound;
-                float r8 = data_ptr[7] * inv_err_bound;
-                
-                int sign1 = (r1 < -0.5f);
-                int sign2 = (r2 < -0.5f);
-                int sign3 = (r3 < -0.5f);
-                int sign4 = (r4 < -0.5f);
-                int sign5 = (r5 < -0.5f);
-                int sign6 = (r6 < -0.5f);
-                int sign7 = (r7 < -0.5f);
-                int sign8 = (r8 < -0.5f);
-                
-                qBuf[i]     = (int)(r1 + 0.5f) - sign1;
-                qBuf[i + 1] = (int)(r2 + 0.5f) - sign2;
-                qBuf[i + 2] = (int)(r3 + 0.5f) - sign3;
-                qBuf[i + 3] = (int)(r4 + 0.5f) - sign4;
-                qBuf[i + 4] = (int)(r5 + 0.5f) - sign5;
-                qBuf[i + 5] = (int)(r6 + 0.5f) - sign6;
-                qBuf[i + 6] = (int)(r7 + 0.5f) - sign7;
-                qBuf[i + 7] = (int)(r8 + 0.5f) - sign8;
+                const float* ptr = oriData + bs + i;
+                __builtin_prefetch(ptr + 8, 0, 1);
+            
+                // load 8 floats, scale, add 0.5, then convert to int
+                __m256  data    = _mm256_loadu_ps(ptr);
+                __m256  scaled  = _mm256_mul_ps(data, inv_err_vec);
+                __m256  shifted = _mm256_add_ps(scaled, half_vec);
+                __m256i qi      = _mm256_cvtps_epi32(shifted);
+            
+                // store back into qBuf
+                _mm256_storeu_si256((__m256i*)(qBuf + i), qi);
             }
             
             // Handle remaining elements with original method
