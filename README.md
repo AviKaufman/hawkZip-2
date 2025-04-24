@@ -1,5 +1,56 @@
 # hawkZip: Lossy Compression for Floating-Point Data
 
+
+## Running our implementation
+
+Unlike the original, our build links against the **Zstandard**  
+library. Follow the three-step checklist below and you will be able to
+compile and execute the enhanced version on any recent Linux system.
+
+---
+
+### Install Zstandard
+
+> **Debian / Ubuntu**
+> ```bash
+> sudo apt-get update
+> sudo apt-get install libzstd-dev   # installs libzstd.so and headers
+> ```
+
+> **RHEL / CentOS / Fedora**
+> ```bash
+> sudo dnf install libzstd-devel     # or: sudo yum install …
+> ```
+
+> **Conda (optional)**
+> ```bash
+> conda install -c conda-forge zstd
+> ```
+> The conda route is only required on machines where you do not have
+> root access.
+
+---
+
+### Compile
+
+```bash
+gcc hawkZip_main.c hawkZip_entry.c hawkZip_compressor.c \
+    -O0 -fopenmp -lm -lzstd -o hawkZip
+
+Ensure the -lzstd flag is present so that it runs properly.
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## Introduction
 HawkZip is a CPU error-bounded lossy compressor designed for floating-point data, developed as part of UIowa: CS:4700. It provides efficient data compression while maintaining accuracy under user-specified error bounds. The goal of this final project is to use any materials from this course to improve **throughput** and **compression ratio** of this compressor.
 
