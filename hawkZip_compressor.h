@@ -2,9 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h> // For uintptr_t
-#include <emmintrin.h>
+//#include <emmintrin.h>
 #include <omp.h>
-#include <immintrin.h> // For AVX intrinsics
+
 
 // fixed at 32
 #ifndef THREAD_COUNT
