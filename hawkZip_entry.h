@@ -26,7 +26,7 @@ void hawkZip_compress(
         fixedRate, threadOfs,
         nbEle, cmpSize,
         errorBound);
-    double t1 = omp_get_wtime();
+    
 
     int origSize = (int)*cmpSize;
 
@@ -45,7 +45,7 @@ void hawkZip_compress(
     free(zBuf);
 
     *cmpSize = 8 + cSize;
- 
+    double t1 = omp_get_wtime();
     // 4) print metrics
     printf("hawkZip   compression ratio:      %f\n",
            (float)(sizeof(float)*nbEle)/(float)(*cmpSize));
@@ -66,7 +66,7 @@ void hawkZip_decompress(
 {
     // compute totalBlocks here
     int totalBlocks = (nbEle + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
+    double t0 = omp_get_wtime();
     // 1) peel off header
     uint32_t origSize = ((uint32_t*)cmpData)[0];
     uint32_t cSize    = ((uint32_t*)cmpData)[1];
@@ -88,7 +88,7 @@ void hawkZip_decompress(
     int*           fixedRate = malloc(sizeof(int) * totalBlocks);
     unsigned int*  threadOfs = malloc(sizeof(unsigned int) * THREAD_COUNT);
 
-    double t0 = omp_get_wtime();
+    
     hawkZip_decompress_kernel(
         decData, planeBuf,
         absQuant, fixedRate, threadOfs,
