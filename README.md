@@ -1,6 +1,6 @@
 # hawkZip: Lossy Compression for Floating-Point Data
-
-
+Github Repo
+[Link](https://github.com/AviKaufman/hawkZip-2)
 ## Running our implementation
 
 Unlike the original, our build links against the **Zstandard**  
@@ -22,7 +22,7 @@ compile and execute the enhanced version on any recent Linux system.
 > sudo dnf install libzstd-devel     # or: sudo yum install …
 > ```
 
-> **Conda (optional)**
+> **Conda**
 > ```bash
 > conda install -c conda-forge zstd
 > ```
@@ -38,6 +38,8 @@ gcc hawkZip_main.c hawkZip_entry.c hawkZip_compressor.c \
     -O0 -fopenmp -lm -lzstd -o hawkZip
 
 Ensure the -lzstd flag is present so that it runs properly.
+
+Run just like example usage.
 
 
 

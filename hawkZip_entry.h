@@ -4,6 +4,7 @@
 #include <omp.h>
 #include <zstd.h>
 #include "hawkZip_compressor.h"
+#include <stdint.h>
 
 void hawkZip_compress(
     float*         oriData,
@@ -26,7 +27,7 @@ void hawkZip_compress(
         fixedRate, threadOfs,
         nbEle, cmpSize,
         errorBound);
-    //double t1 = omp_get_wtime();
+    
 
     int origSize = (int)*cmpSize;
 
@@ -35,7 +36,7 @@ void hawkZip_compress(
     size_t cSize = ZSTD_compress(
         zBuf, ZSTD_compressBound(origSize),
         cmpData, origSize,
-        42 /* speed vs. ratio level */);
+        5 /* speed vs. ratio level */); //Set High for compression ratio
 
     // 3) emit 8‑byte header + Zstd data
     uint32_t* hdr = (uint32_t*)cmpData;
