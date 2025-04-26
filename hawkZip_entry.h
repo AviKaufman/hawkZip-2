@@ -36,7 +36,7 @@ void hawkZip_compress(
     size_t cSize = ZSTD_compress(
         zBuf, ZSTD_compressBound(origSize),
         cmpData, origSize,
-        5 /* speed vs. ratio level */); //Set High for compression ratio
+        42 /* speed vs. ratio level */); //Set High for compression ratio
 
     // 3) emit 8‑byte header + Zstd data
     uint32_t* hdr = (uint32_t*)cmpData;
@@ -93,7 +93,7 @@ void hawkZip_decompress(
     int*           fixedRate = malloc(sizeof(int) * totalBlocks);
     unsigned int*  threadOfs = malloc(sizeof(unsigned int) * THREAD_COUNT);
 
-    //double t0 = omp_get_wtime();
+    
     hawkZip_decompress_kernel(
         decData, planeBuf,
         absQuant, fixedRate, threadOfs,
